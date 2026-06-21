@@ -68,7 +68,7 @@ def strip_html(html):
 
 def _job(title, company, location, url, source, date="", description=""):
     d = description.strip()
-    return {"title":title.strip(),"company":company.strip(),"location":location.strip(),"url":url.strip(),"source":source,"date":date.strip(),"description":d[:600],"job_type":detect_job_type(title,d),"where":detect_remote(location.strip(),d),"summary":make_summary(d)}
+    return {"title":title.strip(),"company":company.strip(),"location":location.strip(),"url":url.strip(),"source":source,"date":str(date).strip(),"description":d[:600],"job_type":detect_job_type(title,d),"where":detect_remote(location.strip(),d),"summary":make_summary(d)}
 
 def scrape_the_muse(internship_only=False):
     print("  [The Muse] ..."); jobs=[]
