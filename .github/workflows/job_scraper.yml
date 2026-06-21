@@ -18,7 +18,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install beautifulsoup4 lxml
+        run: pip install beautifulsoup4 lxml deep-translator langdetect
 
       - name: Run job scraper
         run: python job_scraper.py --no-indeed --no-linkedin --output-dir results
