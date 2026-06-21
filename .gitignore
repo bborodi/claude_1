@@ -1,0 +1,5 @@
+results/
+design_jobs_*.csv
+design_jobs_*.json
+__pycache__/
+*.pyc

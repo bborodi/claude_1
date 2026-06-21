@@ -1,0 +1,44 @@
+name: Daily Design Jobs Email
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape-and-email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install beautifulsoup4 lxml
+
+      - name: Run job scraper
+        run: python job_scraper.py --no-indeed --no-linkedin --output-dir results
+
+      - name: Send email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "Design Jobs - ${{ github.run_id }}"
+          to: bertieborodi@gmail.com
+          from: Design Jobs Bot <${{ secrets.GMAIL_USERNAME }}>
+          html_body: file://results/email.html
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-jobs-${{ github.run_id }}
+          path: results/
+          retention-days: 30
