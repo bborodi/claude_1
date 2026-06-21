@@ -3,3 +3,5 @@ lxml>=5.0
 requests>=2.31
 deep-translator>=1.11
 langdetect>=1.0.9
+python-jobspy>=0.1.0
+pandas>=2.0

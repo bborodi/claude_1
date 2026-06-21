@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, csv, json, os, re, time, urllib.parse, urllib.request
+import csv, json, os, re, time, urllib.parse, urllib.request
 from datetime import datetime
 from xml.etree import ElementTree
 try:
@@ -8,81 +8,73 @@ try:
 except ImportError:
     _BS4 = False
 try:
+    import jobspy
+    _JOBSPY = True
+except ImportError:
+    _JOBSPY = False
+try:
     from deep_translator import GoogleTranslator
     from langdetect import detect as lang_detect
     _TRANSLATE = True
 except ImportError:
     _TRANSLATE = False
 
+SEEN_FILE   = os.path.join(os.path.dirname(__file__), "seen_jobs.json")
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
-DEFAULT_CONFIG = {"adzuna_app_id":"","adzuna_app_key":"","location":"","country":"us","remote_only":False,"internship_only":False,"output_dir":"results"}
 
 def load_config():
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = {"output_dir": "results"}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f: cfg.update(json.load(f))
-    cfg["adzuna_app_id"] = os.getenv("ADZUNA_APP_ID", cfg["adzuna_app_id"])
-    cfg["adzuna_app_key"] = os.getenv("ADZUNA_APP_KEY", cfg["adzuna_app_key"])
     return cfg
 
-DESIGN_KEYWORDS = {"graphic design","graphic designer","brand designer","branding","packaging designer","packaging design","visual designer","ui designer","ux designer","ui/ux","product designer","art director","creative director","illustration","illustrator","typography","motion designer","motion graphics","design intern","design internship","junior designer","marketing designer","digital designer","print designer","identity designer","logo designer","layout designer"}
-EXCLUDE_FRAGMENTS = {"interior design","landscape design","fashion design","industrial design","mechanical engineer","software engineer","data scientist","accountant","nurse","teacher"}
+def load_seen():
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE) as f: return set(json.load(f))
+    return set()
 
-def is_relevant(title, body=""):
-    text = (title+" "+body).lower()
-    if any(ex in text for ex in EXCLUDE_FRAGMENTS): return False
-    return any(kw in text for kw in DESIGN_KEYWORDS)
+def save_seen(seen):
+    with open(SEEN_FILE, "w") as f: json.dump(sorted(seen), f, indent=2)
 
-def detect_job_type(title, body):
-    text = (title+" "+body).lower()
-    if any(w in text for w in ["part-time","part time","parttime"]): return "Part-time"
-    if any(w in text for w in ["intern","internship","placement"]): return "Internship"
-    if any(w in text for w in ["contract","freelance"]): return "Contract"
-    return "Full-time"
+TIER1 = {"graphic design","graphic designer","brand designer","packaging designer","packaging design","brand identity","visual identity"}
+TIER2 = {"visual designer","art director","motion designer","motion graphics","ui designer","ui/ux","digital designer","print designer","identity designer","logo designer","illustration","illustrator"}
+TIER3 = {"creative designer","marketing designer","layout designer","junior designer","design intern","design internship","creative director","content designer","multimedia"}
+EXCLUDE = {"interior design","landscape design","fashion design","industrial design","mechanical","software engineer","data scientist","accountant","nurse","teacher","real estate","sales","recruiter"}
+UK_TERMS = {"uk","united kingdom","england","scotland","wales","northern ireland","london","manchester","birmingham","leeds","glasgow","edinburgh","bristol","liverpool","sheffield","cambridge","oxford","brighton","newcastle","nottingham","cardiff","belfast","reading","coventry"}
+EU_WORLDWIDE = {"europe","european union","eu","germany","france","spain","italy","netherlands","belgium","sweden","denmark","norway","finland","ireland","portugal","austria","switzerland","poland","worldwide","anywhere","global","remote"}
+JUNIOR_BOOSTS = {"junior","graduate","entry","intern","internship","placement","assistant","trainee"}
 
-def detect_remote(location, body):
-    loc = location.lower(); text = body.lower()
-    if any(w in loc or w in text for w in ["remote","anywhere","worldwide"]): return "Remote"
-    if any(w in text for w in ["hybrid","flexible"]): return f"Hybrid – {location}" if location else "Hybrid"
-    return location if location else "Not specified"
-
-def make_summary(description):
-    text = re.sub(r"\s+"," ",description).strip()
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    good = [s for s in sentences if len(s)>30][:2]
-    summary = " ".join(good)
-    return summary[:280]+("…" if len(summary)>280 else "")
-
-UK_TERMS = {"uk","united kingdom","england","scotland","wales","northern ireland","london","manchester","birmingham","leeds","glasgow","edinburgh","bristol","liverpool","sheffield","cambridge","oxford","brighton","newcastle","nottingham","cardiff","belfast"}
-EU_COUNTRIES = {"europe","european union","eu","germany","france","spain","italy","netherlands","belgium","sweden","denmark","norway","finland","ireland","portugal","austria","switzerland","poland","czech","hungary","romania","bulgaria","croatia","slovakia","slovenia","luxembourg","malta","cyprus","estonia","latvia","lithuania","greece","worldwide","anywhere","global"}
+def score_job(title, body, location):
+    t = title.lower(); b = (body or "").lower(); loc = location.lower(); combined = t+" "+b
+    if any(ex in combined for ex in EXCLUDE): return 0
+    if any(kw in t for kw in TIER1): stars=5
+    elif any(kw in t for kw in TIER2): stars=4
+    elif any(kw in t for kw in TIER3): stars=3
+    elif any(kw in b for kw in TIER1|TIER2): stars=2
+    elif any(kw in b for kw in TIER3): stars=1
+    else: return 0
+    if any(w in t for w in JUNIOR_BOOSTS): stars=min(5,stars+1)
+    if not any(w in loc for w in UK_TERMS|EU_WORLDWIDE): stars=max(1,stars-1)
+    return stars
 
 def is_uk_or_eu_remote(job):
-    loc = (job.get("location","")+" "+job.get("where","")).lower()
-    where = job.get("where","").lower()
-    if any(term in loc for term in UK_TERMS): return True
-    if "remote" in where or "hybrid" in where:
-        if any(term in loc for term in EU_COUNTRIES): return True
+    loc=(job.get("location","")+" "+job.get("where","")).lower(); where=job.get("where","").lower()
+    if any(t in loc for t in UK_TERMS): return True
+    if "remote" in where or "hybrid" in where or not job.get("location","").strip():
+        if any(t in loc for t in EU_WORLDWIDE): return True
         if job.get("location","").strip() in ("","Remote","Worldwide","Anywhere"): return True
     return False
 
-def translate_to_english(text):
-    if not text or not _TRANSLATE: return text
-    try:
-        if lang_detect(text) == "en": return text
-        return GoogleTranslator(source="auto", target="en").translate(text) or text
-    except Exception: return text
-
-HEADERS={"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36","Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"en-US,en;q=0.9"}
+HEADERS={"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36","Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"en-GB,en;q=0.9"}
 
 def fetch_text(url, timeout=20):
-    req = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r: return r.read().decode("utf-8",errors="replace")
-    except Exception as e:
-        print(f"  [warn] {url[:70]}... → {e}"); return None
+        req=urllib.request.Request(url,headers=HEADERS)
+        with urllib.request.urlopen(req,timeout=timeout) as r: return r.read().decode("utf-8",errors="replace")
+    except Exception as e: print(f"  [warn] {url[:70]}... → {e}"); return None
 
 def fetch_json(url, timeout=20):
-    raw = fetch_text(url, timeout)
+    raw=fetch_text(url,timeout)
     if not raw: return None
     try: return json.loads(raw)
     except: return None
@@ -91,35 +83,83 @@ def strip_html(html):
     if _BS4: return BeautifulSoup(html,"lxml").get_text(" ",strip=True)
     return re.sub(r"<[^>]+>"," ",html).strip()
 
-def _job(title, company, location, url, source, date="", description=""):
-    d = description.strip()
-    return {"title":title.strip(),"company":company.strip(),"location":location.strip(),"url":url.strip(),"source":source,"date":str(date).strip(),"description":d[:600],"job_type":detect_job_type(title,d),"where":detect_remote(location.strip(),d),"summary":make_summary(d)}
+def detect_job_type(title, body):
+    text=(title+" "+body).lower()
+    if any(w in text for w in ["part-time","part time"]): return "Part-time"
+    if any(w in text for w in ["intern","internship","placement","work experience"]): return "Internship"
+    if any(w in text for w in ["contract","freelance"]): return "Contract"
+    return "Full-time"
 
-def scrape_the_muse(internship_only=False):
+def detect_where(location, body):
+    loc=location.lower(); text=body.lower()
+    if any(w in loc or w in text for w in ["remote","anywhere","worldwide"]): return "Remote"
+    if "hybrid" in text: return f"Hybrid – {location}" if location else "Hybrid"
+    return location if location else "Not specified"
+
+def make_summary(description):
+    text=re.sub(r"\s+"," ",description or "").strip()
+    sentences=re.split(r"(?<=[.!?])\s+",text)
+    good=[s for s in sentences if len(s)>30][:2]
+    out=" ".join(good)
+    return out[:280]+("…" if len(out)>280 else "")
+
+def translate_to_english(text):
+    if not text or not _TRANSLATE: return text
+    try:
+        if lang_detect(text)=="en": return text
+        return GoogleTranslator(source="auto",target="en").translate(text) or text
+    except: return text
+
+def _job(title,company,location,url,source,date="",description=""):
+    d=description.strip() if description else ""
+    return {"title":title.strip(),"company":company.strip(),"location":location.strip(),"url":url.strip(),"source":source,"date":str(date).strip(),"description":d[:600],"job_type":detect_job_type(title,d),"where":detect_where(location.strip(),d),"summary":make_summary(d),"stars":score_job(title,d,location)}
+
+def scrape_jobspy():
+    if not _JOBSPY: print("  [JobSpy] not installed — skipping"); return []
+    print("  [JobSpy] LinkedIn · Glassdoor · Google Jobs · Indeed ...")
+    all_jobs=[]; seen_urls=set()
+    queries=["graphic designer","graphic design internship","brand designer","packaging designer","visual designer","ui designer","junior designer"]
+    for query in queries:
+        try:
+            df=jobspy.scrape_jobs(site_name=["linkedin","glassdoor","google","indeed"],search_term=query,location="United Kingdom",results_wanted=25,hours_old=48,country_indeed="UK",verbose=0)
+            for _,row in df.iterrows():
+                url=str(row.get("job_url") or row.get("url") or "")
+                if not url or url in seen_urls: continue
+                seen_urls.add(url)
+                title=str(row.get("title") or ""); company=str(row.get("company") or "Unknown")
+                loc=str(row.get("location") or ""); desc=str(row.get("description") or "")
+                date=str(row.get("date_posted") or ""); source=str(row.get("site") or "JobSpy").title()
+                j=_job(title,company,loc,url,source,date,desc)
+                if j["stars"]>0: all_jobs.append(j)
+            time.sleep(2)
+        except Exception as e: print(f"  [JobSpy] '{query}' failed: {e}")
+    print(f"     → {len(all_jobs)} jobs"); return all_jobs
+
+def scrape_the_muse():
     print("  [The Muse] ..."); jobs=[]
     for page in range(0,5):
         data=fetch_json(f"https://www.themuse.com/api/public/jobs?category=Design%20%26%20UX&page={page}")
         if not data or not data.get("results"): break
         for item in data["results"]:
             title=item.get("name",""); company=item.get("company",{}).get("name","Unknown")
-            locs=item.get("locations",[]); location=locs[0].get("name","") if locs else "Remote"
+            locs=item.get("locations",[]); loc=locs[0].get("name","") if locs else "Remote"
             link=item.get("refs",{}).get("landing_page",""); pub=item.get("publication_date","")
             body=strip_html(item.get("contents",""))
-            if internship_only and "intern" not in title.lower(): continue
-            if is_relevant(title,body): jobs.append(_job(title,company,location,link,"The Muse",pub,body))
+            j=_job(title,company,loc,link,"The Muse",pub,body)
+            if j["stars"]>0: jobs.append(j)
         time.sleep(0.5)
     print(f"     → {len(jobs)} jobs"); return jobs
 
-def scrape_remotive(internship_only=False):
+def scrape_remotive():
     print("  [Remotive] ..."); jobs=[]
     data=fetch_json("https://remotive.com/api/remote-jobs?category=design-creative")
     if not data: return jobs
     for item in data.get("jobs",[]):
         title=item.get("title",""); company=item.get("company_name","Unknown")
-        location=item.get("candidate_required_location","Remote"); link=item.get("url","")
+        loc=item.get("candidate_required_location","Remote"); link=item.get("url","")
         pub=item.get("publication_date",""); body=strip_html(item.get("description",""))
-        if internship_only and "intern" not in title.lower(): continue
-        if is_relevant(title,body): jobs.append(_job(title,company,location,link,"Remotive",pub,body))
+        j=_job(title,company,loc,link,"Remotive",pub,body)
+        if j["stars"]>0: jobs.append(j)
     print(f"     → {len(jobs)} jobs"); return jobs
 
 def scrape_arbeitnow():
@@ -128,13 +168,14 @@ def scrape_arbeitnow():
     if not data: return jobs
     for item in data.get("data",[]):
         title=item.get("title",""); company=item.get("company_name","Unknown")
-        location=item.get("location",""); link=item.get("url",""); pub=item.get("created_at","")
-        tags=" ".join(item.get("tags",[])); body=strip_html(item.get("description",""))
-        if is_relevant(title,tags+" "+body): jobs.append(_job(title,company,location,link,"Arbeitnow",pub,body))
+        loc=item.get("location",""); link=item.get("url",""); pub=item.get("created_at","")
+        body=strip_html(item.get("description",""))
+        j=_job(title,company,loc,link,"Arbeitnow",pub,body)
+        if j["stars"]>0: jobs.append(j)
     print(f"     → {len(jobs)} jobs"); return jobs
 
-def scrape_jobicy_rss():
-    print("  [Jobicy RSS] ..."); jobs=[]
+def scrape_jobicy():
+    print("  [Jobicy] ..."); jobs=[]
     xml=fetch_text("https://jobicy.com/?feed=job_feed&job_categories=design&listing_type=full_time")
     if not xml: return jobs
     try: root=ElementTree.fromstring(xml)
@@ -145,93 +186,66 @@ def scrape_jobicy_rss():
         title=t("title"); link=t("link"); desc=strip_html(t("description")); pub=t("pubDate")
         creator=item.find("{http://purl.org/dc/elements/1.1/}creator")
         company=creator.text.strip() if creator is not None and creator.text else "Unknown"
-        if is_relevant(title,desc): jobs.append(_job(title,company,"Remote",link,"Jobicy",pub,desc))
-    print(f"     → {len(jobs)} jobs"); return jobs
-
-def scrape_indeed_rss(query, location=""):
-    jobs=[]; q=urllib.parse.quote_plus(query); loc=urllib.parse.quote_plus(location)
-    xml=fetch_text(f"https://www.indeed.com/rss?q={q}&l={loc}&sort=date&fromage=14")
-    if not xml: return jobs
-    try: root=ElementTree.fromstring(xml)
-    except: return jobs
-    for item in root.findall(".//item"):
-        def t(tag):
-            el=item.find(tag); return (el.text or "").strip() if el is not None else ""
-        title=t("title"); link=t("link"); desc=strip_html(t("description")); pub=t("pubDate")
-        if is_relevant(title,desc): jobs.append(_job(title,"Unknown",location,link,"Indeed",pub,desc))
-    return jobs
-
-def scrape_indeed_all(location="", internship_only=False):
-    print(f"  [Indeed RSS] location={location or 'any'} ...")
-    queries=["graphic design internship","design intern"] if internship_only else ["graphic designer","graphic design internship","brand designer","packaging designer","visual designer","ui designer"]
-    jobs=[]
-    for q in queries: jobs+=scrape_indeed_rss(q,location); time.sleep(1)
-    print(f"     → {len(jobs)} jobs"); return jobs
-
-def scrape_linkedin_public(query):
-    if not _BS4: return []
-    jobs=[]; q=urllib.parse.quote_plus(query)
-    html=fetch_text(f"https://www.linkedin.com/jobs/search/?keywords={q}&f_TPR=r604800&sortBy=DD")
-    if not html: return jobs
-    soup=BeautifulSoup(html,"lxml")
-    for card in soup.select("div.base-card"):
-        te=card.select_one("h3.base-search-card__title"); ce=card.select_one("h4.base-search-card__subtitle")
-        le=card.select_one("span.job-search-card__location"); lke=card.select_one("a.base-card__full-link"); de=card.select_one("time")
-        title=te.get_text(strip=True) if te else ""; company=ce.get_text(strip=True) if ce else "Unknown"
-        loc=le.get_text(strip=True) if le else ""; link=lke["href"] if lke else ""; date=de.get("datetime","") if de else ""
-        if title and is_relevant(title): jobs.append(_job(title,company,loc,link,"LinkedIn",date))
-    return jobs
-
-def scrape_linkedin_all(internship_only=False):
-    print("  [LinkedIn public] ...")
-    queries=["graphic design internship","design intern"] if internship_only else ["graphic designer","brand designer","visual designer"]
-    jobs=[]
-    for q in queries: jobs+=scrape_linkedin_public(q); time.sleep(2)
+        j=_job(title,company,"Remote",link,"Jobicy",pub,desc)
+        if j["stars"]>0: jobs.append(j)
     print(f"     → {len(jobs)} jobs"); return jobs
 
 def dedup(jobs):
     seen=set(); out=[]
     for j in jobs:
-        key=(j["title"].lower(),j["company"].lower())
+        key=(j["title"].lower()[:40],j["company"].lower()[:30])
         if key not in seen: seen.add(key); out.append(j)
     return out
+
+STAR_COLOURS={5:"#2ecc71",4:"#27ae60",3:"#f39c12",2:"#e67e22",1:"#95a5a6"}
+SOURCE_COLOURS={"Linkedin":"#0077b5","Glassdoor":"#0caa41","Google":"#4285f4","Indeed":"#2089e3","The Muse":"#6c63ff","Remotive":"#00b894","Arbeitnow":"#0984e3","Jobicy":"#e17055"}
+
+def stars_html(n):
+    colour=STAR_COLOURS.get(n,"#ccc")
+    return f'<span style="color:{colour};font-size:15px;">{"★"*n}</span><span style="color:#ddd;font-size:15px;">{"☆"*(5-n)}</span>'
 
 def build_html_email(jobs, date_str):
     count=len(jobs); rows=""
     for j in jobs:
-        badge={"The Muse":"#6c63ff","Remotive":"#00b894","Arbeitnow":"#0984e3","Jobicy":"#e17055","Indeed":"#2089e3","LinkedIn":"#0077b5","Adzuna":"#fdcb6e"}.get(j["source"],"#888")
+        badge=SOURCE_COLOURS.get(j["source"],"#888")
         ri="🌍 " if "remote" in j["where"].lower() else "📍 "
         ti={"Internship":"🎓 ","Part-time":"⏰ ","Contract":"📋 ","Full-time":"💼 "}.get(j["job_type"],"")
-        rows+=f'<tr><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;"><a href="{j["url"]}" style="color:#1a1a2e;font-weight:600;font-size:14px;text-decoration:none;">{j["title"]}</a><br><span style="color:#666;font-size:12px;">{j["company"]}</span><br><span style="display:inline-block;margin-top:4px;padding:2px 7px;border-radius:10px;font-size:11px;color:#fff;background:{badge};">{j["source"]}</span></td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;font-size:13px;color:#444;">{ri}{j["where"]}</td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;font-size:13px;color:#444;">{ti}{j["job_type"]}</td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;font-size:13px;color:#555;max-width:340px;">{j["summary"] or "No description available."}</td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;text-align:center;"><a href="{j["url"]}" style="display:inline-block;padding:6px 14px;background:#1a1a2e;color:#fff;border-radius:6px;font-size:12px;text-decoration:none;white-space:nowrap;">View →</a></td></tr>'
-    return f'''<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f7;padding:30px 0;"><tr><td align="center"><table width="700" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);"><tr><td style="background:#1a1a2e;padding:28px 32px;"><h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;">🎨 Design Jobs Daily</h1><p style="margin:6px 0 0;color:#a0a8c0;font-size:14px;">{date_str} · {count} new listing{"s" if count!=1 else ""} found · UK &amp; EU Remote</p></td></tr><tr><td style="padding:0 0 24px;"><table width="100%" cellpadding="0" cellspacing="0"><thead><tr style="background:#f8f8fb;"><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">Role &amp; Company</th><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">Location</th><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">Type</th><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">What they need</th><th></th></tr></thead><tbody>{rows}</tbody></table></td></tr><tr><td style="padding:20px 32px;background:#f8f8fb;border-top:1px solid #eee;"><p style="margin:0;color:#aaa;font-size:12px;text-align:center;">Sent automatically every morning · UK jobs &amp; EU remote only · Sources: The Muse, Remotive, Arbeitnow, Jobicy</p></td></tr></table></td></tr></table></body></html>'''
+        rows+=f'<tr><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;min-width:180px;"><a href="{j["url"]}" style="color:#1a1a2e;font-weight:600;font-size:14px;text-decoration:none;">{j["title"]}</a><br><span style="color:#666;font-size:12px;">{j["company"]}</span><br><span style="display:inline-block;margin-top:5px;padding:2px 7px;border-radius:10px;font-size:11px;color:#fff;background:{badge};">{j["source"]}</span></td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;font-size:13px;color:#444;white-space:nowrap;">{ri}{j["where"]}</td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;font-size:13px;color:#444;white-space:nowrap;">{ti}{j["job_type"]}</td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;">{stars_html(j["stars"])}</td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;font-size:13px;color:#555;max-width:320px;">{j["summary"] or "No description available."}</td><td style="padding:14px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;text-align:center;"><a href="{j["url"]}" style="display:inline-block;padding:6px 14px;background:#1a1a2e;color:#fff;border-radius:6px;font-size:12px;text-decoration:none;white-space:nowrap;">View →</a></td></tr>'
+    if not jobs: rows='<tr><td colspan="6" style="padding:32px;text-align:center;color:#aaa;font-size:14px;">No new design jobs today — check back tomorrow.</td></tr>'
+    return f'''<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f7;padding:30px 0;"><tr><td align="center"><table width="780" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);"><tr><td style="background:#1a1a2e;padding:28px 32px;"><h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;">🎨 Design Jobs Daily</h1><p style="margin:6px 0 0;color:#a0a8c0;font-size:14px;">{date_str} · {count} new listing{"s" if count!=1 else ""} · UK &amp; EU Remote · sorted by relevance</p></td></tr><tr><td style="padding:0 0 24px;"><table width="100%" cellpadding="0" cellspacing="0"><thead><tr style="background:#f8f8fb;"><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">Role &amp; Company</th><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">Location</th><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">Type</th><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">Match</th><th style="padding:12px;text-align:left;font-size:11px;text-transform:uppercase;color:#999;font-weight:600;">What they need</th><th></th></tr></thead><tbody>{rows}</tbody></table></td></tr><tr><td style="padding:20px 32px;background:#f8f8fb;border-top:1px solid #eee;"><p style="margin:0;color:#aaa;font-size:12px;text-align:center;">★★★★★ = perfect match · Only new listings shown · Sources: LinkedIn, Glassdoor, Google Jobs, Indeed, Remotive, The Muse, Arbeitnow, Jobicy</p></td></tr></table></td></tr></table></body></html>'''
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--location",default=""); p.add_argument("--remote-only",action="store_true"); p.add_argument("--internship",action="store_true"); p.add_argument("--no-indeed",action="store_true"); p.add_argument("--no-linkedin",action="store_true"); p.add_argument("--output-dir",default="")
+    import argparse
+    p=argparse.ArgumentParser(); p.add_argument("--output-dir",default="")
     args=p.parse_args(); cfg=load_config()
-    location=args.location or cfg.get("location",""); remote_only=args.remote_only or cfg.get("remote_only",False)
-    internship=args.internship or cfg.get("internship_only",False); output_dir=args.output_dir or cfg.get("output_dir","results")
+    output_dir=args.output_dir or cfg.get("output_dir","results")
     os.makedirs(output_dir,exist_ok=True)
-    print(f"Graphic Design Job Scraper\n  Location: {location or 'anywhere'}\n")
+    print("🎨 Graphic Design Job Scraper\n")
+    seen=load_seen(); print(f"  Seen jobs so far: {len(seen)}\n")
     jobs=[]
-    jobs+=scrape_the_muse(internship_only=internship); jobs+=scrape_remotive(internship_only=internship)
-    jobs+=scrape_arbeitnow(); jobs+=scrape_jobicy_rss()
-    if not args.no_indeed: jobs+=scrape_indeed_all(location=location,internship_only=internship)
-    if not args.no_linkedin: jobs+=scrape_linkedin_all(internship_only=internship)
-    if remote_only: jobs=[j for j in jobs if "remote" in j["where"].lower()]
+    jobs+=scrape_jobspy(); jobs+=scrape_the_muse(); jobs+=scrape_remotive()
+    jobs+=scrape_arbeitnow(); jobs+=scrape_jobicy()
     before=len(jobs); jobs=[j for j in jobs if is_uk_or_eu_remote(j)]
-    print(f"  Location filter: {before} → {len(jobs)} jobs (UK + EU remote)")
-    if _TRANSLATE:
+    print(f"\n  Location filter: {before} → {len(jobs)} (UK + EU remote)")
+    new_jobs=[j for j in jobs if j["url"] not in seen]
+    print(f"  New jobs (not seen before): {len(new_jobs)}")
+    new_jobs=dedup(new_jobs)
+    if _TRANSLATE and new_jobs:
         print("  Translating non-English descriptions...")
-        for j in jobs: j["summary"]=translate_to_english(j["summary"])
-    jobs=dedup(jobs); jobs.sort(key=lambda j:j.get("date",""),reverse=True)
+        for j in new_jobs: j["summary"]=translate_to_english(j["summary"])
+    new_jobs.sort(key=lambda j:(j["stars"],j.get("date","")),reverse=True)
+    seen.update(j["url"] for j in new_jobs); save_seen(seen)
     ts=datetime.now().strftime("%Y%m%d_%H%M"); date_str=datetime.now().strftime("%A, %d %B %Y")
     base=os.path.join(output_dir,f"design_jobs_{ts}")
-    fields=["title","company","where","job_type","source","date","url","summary"]
+    fields=["title","company","where","job_type","stars","source","date","url","summary"]
     with open(base+".csv","w",newline="",encoding="utf-8") as f:
-        w=csv.DictWriter(f,fieldnames=fields,extrasaction="ignore"); w.writeheader(); w.writerows(jobs)
-    with open(base+".json","w",encoding="utf-8") as f: json.dump(jobs,f,indent=2)
+        w=csv.DictWriter(f,fieldnames=fields,extrasaction="ignore"); w.writeheader(); w.writerows(new_jobs)
+    with open(base+".json","w",encoding="utf-8") as f: json.dump(new_jobs,f,indent=2)
     html_path=os.path.join(output_dir,"email.html")
-    with open(html_path,"w",encoding="utf-8") as f: f.write(build_html_email(jobs,date_str))
-    print(f"\n{len(jobs)} jobs found. Saved to {output_dir}/")
+    with open(html_path,"w",encoding="utf-8") as f: f.write(build_html_email(new_jobs,date_str))
+    print(f"\n  ✓ {len(new_jobs)} new jobs · saved to {output_dir}/")
+    print(f"  ✓ seen_jobs.json updated ({len(seen)} total)")
+    print("\n  Top matches:")
+    for j in new_jobs[:5]: print(f"  {'★'*j['stars']} {j['title']} @ {j['company']} [{j['where']}]")
 
 if __name__=="__main__": main()
