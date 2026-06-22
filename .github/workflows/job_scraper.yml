@@ -43,7 +43,7 @@ jobs:
           username: ${{ secrets.GMAIL_USERNAME }}
           password: ${{ secrets.GMAIL_APP_PASSWORD }}
           subject: "🎨 Design Jobs – ${{ github.run_id }}"
-          to: bertieborodi@gmail.com
+          to: ${{ secrets.RECIPIENT_EMAIL }}
           from: Design Jobs Bot <${{ secrets.GMAIL_USERNAME }}>
           html_body: file://results/email.html
 
